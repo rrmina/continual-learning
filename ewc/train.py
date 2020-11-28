@@ -7,6 +7,7 @@ from torchvision import datasets, transforms
 from data import PermutedMNIST
 from models import Network
 from utils import parse_args
+from ewc import EWC
 
 import random
 import ipdb
@@ -31,10 +32,11 @@ def main(args):
         test_loaders[i] = torch.utils.data.DataLoader(test_datasets[i], batch_size=args.batch_size, shuffle=True)
         random.shuffle(permute_idx)
 
-    # Model, Optimizer, Criterion
+    # Model, Optimizer, Criterion, ewc_class if needed
     model = Network().to(device)
     optimizer = optim.Adam(model.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
+    ewc_class = None
 
     # Recoders
     train_losses, train_accs, test_losses, test_accs = {}, {}, {}, {}
@@ -42,7 +44,7 @@ def main(args):
     # Train Proper
     for i in range(args.num_tasks):
         print("Currently Training on Task {}".format(i + 1))
-
+        curr_task = i
         # Initialize per task recorders
         train_losses[i], train_accs[i], test_losses[i], test_accs[i] = [], [], [], []
         NUM_EPOCHS = args.num_epochs_per_task
@@ -53,7 +55,11 @@ def main(args):
                 optimizer, 
                 criterion,
                 train_loaders[i],
-                device
+                device,
+                args.ewc_train,
+                ewc_class,
+                args.ewc_weight,
+                curr_task
             )
             print("[Train Epoch {:>5}/{}]  loss: {:>0.4f} | acc: {:>0.4f}".format(epoch, NUM_EPOCHS, train_loss, train_acc))
             # Record Loss
@@ -71,16 +77,26 @@ def main(args):
                 print("[ Test Epoch {:>5}/{}]  loss: {:>0.4f} | acc: {:>0.4f}  [Task {}]".format(epoch, NUM_EPOCHS, test_loss, test_acc, j))
 
                 test_losses[j].append(test_loss)
-                test_accs[j].append(test_acc)  
+                test_accs[j].append(test_acc) 
+
+        if (args.ewc_train):
+            # Consolidate
+            ewc_class = EWC(model, train_loaders, curr_task, device) 
 
     # Save Losses and Accuracies
-    torch.save(train_losses, "train_losses.txt")
-    torch.save(train_accs, "train_accs.txt")
-    torch.save(test_losses, "test_losses.txt")
-    torch.save(test_accs, "test_accs.txt")
+    suffixes = "{}_{}_{}_{}_{}".format(
+        str(args.num_tasks),
+        str(args.num_epochs_per_task),
+        str(args.ewc_weight),
+        "ewc" if args.ewc_train else "std", 
+        args.custom_suffix)
+    torch.save(train_losses, "train_losses_{}.txt".format(suffixes))
+    torch.save(train_accs, "train_accs_{}.txt".format(suffixes))
+    torch.save(test_losses, "test_losses_{}.txt".format(suffixes))
+    torch.save(test_accs, "test_accs_{}.txt".format(suffixes))
 
 
-def train(model, optimizer, criterion, loader, device):
+def train(model, optimizer, criterion, loader, device, ewc_train, ewc_class, ewc_weight, curr_task):
     model.train()
 
     train_loss, corrects, num_samples = 0, 0, 0
@@ -92,6 +108,13 @@ def train(model, optimizer, criterion, loader, device):
         optimizer.zero_grad()
         out = model(x)
         loss = criterion(out, y)
+
+        # Add EWC Loss if needed
+        ewc_loss = torch.tensor(0)
+        if ((ewc_train) and (curr_task != 0)):
+            ewc_loss = ewc_weight * ewc_class.ewc_loss(model)
+            loss += ewc_loss
+
         loss.backward()
         optimizer.step()
 
@@ -119,6 +142,7 @@ def test(model, criterion, loader, device):
             loss = criterion(out, y)
 
             # Record Loss
+            # During we don't need to know the EWC loss
             test_loss += batch_size * loss.item()
             num_samples += batch_size
 
